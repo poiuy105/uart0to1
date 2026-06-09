@@ -30,8 +30,8 @@ static const char *TAG = "UART_FWD";
 #define ANSI_BOLD    "\033[1m"
 
 /* ============ 引脚定义 ============ */
-#define UART1_RX_PIN    GPIO_NUM_1
-#define UART1_TX_PIN    GPIO_NUM_0
+#define UART1_RX_PIN    GPIO_NUM_0
+#define UART1_TX_PIN    GPIO_NUM_1
 
 /* ============ 缓冲与波特率配置 ============ */
 #define UART_BAUD_RATE  5000000     // 5 MBaud - ESP32-C3 极限
@@ -124,6 +124,11 @@ static void uart_forward_task(void *param)
  */
 static void uart_init_port(uart_port_t port, int tx_pin, int rx_pin, QueueHandle_t *evt_queue)
 {
+    /* UART0 可能被 console 占用，先尝试删除已有驱动 */
+    if (port == UART_NUM_0) {
+        uart_driver_delete(UART_NUM_0);
+    }
+
     uart_config_t cfg = {
         .baud_rate  = UART_BAUD_RATE,
         .data_bits  = UART_DATA_8_BITS,
