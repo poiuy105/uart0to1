@@ -30,8 +30,8 @@ static const char *TAG = "UART_FWD";
 #define ANSI_BOLD    "\033[1m"
 
 /* ============ 引脚定义 ============ */
-#define UART1_RX_PIN    GPIO_NUM_0
-#define UART1_TX_PIN    GPIO_NUM_1
+#define UART1_RX_PIN    GPIO_NUM_1
+#define UART1_TX_PIN    GPIO_NUM_0
 
 /* ============ 缓冲与波特率配置 ============ */
 #define UART_BAUD_RATE  5000000     // 5 MBaud - ESP32-C3 极限
