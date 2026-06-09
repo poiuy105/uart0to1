@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 
 static const char *TAG = "UART_FWD";
