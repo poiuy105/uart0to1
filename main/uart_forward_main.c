@@ -118,7 +118,7 @@ static void monitor_task(void *param)
         vTaskDelay(pdMS_TO_TICKS(5000));
         uint32_t a = fwd_0_to_1_bytes;
         uint32_t b = fwd_1_to_0_bytes;
-        ESP_LOGI(TAG, "[STATS] UART0->UART1: %u bytes | UART1->UART0: %u bytes", a, b);
+        ESP_LOGI(TAG, "[STATS] UART0->UART1: %lu bytes | UART1->UART0: %lu bytes", (unsigned long)a, (unsigned long)b);
     }
 }
 
