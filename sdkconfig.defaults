@@ -1,5 +1,8 @@
-# 禁用 UART 控制台输出，释放 UART0 用于数据转发
-CONFIG_ESP_CONSOLE_UART_NONE=y
+# Console 输出使用 USB Serial/JTAG (COM口), 释放 UART0 用于数据转发
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 禁用 secondary console 避免干扰
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # ESP32-C3 目标芯片
 CONFIG_IDF_TARGET="esp32c3"
