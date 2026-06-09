@@ -1,0 +1,163 @@
+/**
+ * UART0 <-> UART1 双向转发 (ESP32-C3)
+ *
+ * UART0: 默认引脚 (GPIO20=RX, GPIO21=TX)
+ * UART1: RX=GPIO0, TX=GPIO1
+ * 波特率: 5,000,000 (5 MBaud) - ESP32-C3 极限波特率
+ *
+ * 采用事件驱动模型，双任务并行转发，高优先级运行
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+
+static const char *TAG = "UART_FWD";
+
+/* ============ 引脚定义 ============ */
+#define UART1_RX_PIN    GPIO_NUM_0
+#define UART1_TX_PIN    GPIO_NUM_1
+
+/* ============ 缓冲与波特率配置 ============ */
+#define UART_BAUD_RATE  5000000     // 5 MBaud - ESP32-C3 极限
+#define BUF_SIZE        4096        // 驱动 ring buffer 大小
+#define RD_BUF_SIZE     4096        // 单次读取缓冲区
+#define EVT_QUEUE_SIZE  20          // 事件队列深度
+
+/* ============ 事件队列句柄 ============ */
+static QueueHandle_t uart0_evt_queue = NULL;
+static QueueHandle_t uart1_evt_queue = NULL;
+
+/**
+ * @brief 通用 UART 事件处理任务
+ *
+ * 从 source_uart 读取数据，写入 target_uart
+ *
+ * @param param 指向 uart_port_t[2] 数组的指针: [source, target]
+ */
+static void uart_forward_task(void *param)
+{
+    uart_port_t *ports = (uart_port_t *)param;
+    uart_port_t src  = ports[0];
+    uart_port_t dest = ports[1];
+    QueueHandle_t evt_queue = (src == UART_NUM_0) ? uart0_evt_queue : uart1_evt_queue;
+
+    uart_event_t event;
+    uint8_t *buf = (uint8_t *)malloc(RD_BUF_SIZE);
+    assert(buf);
+
+    for (;;) {
+        if (xQueueReceive(evt_queue, (void *)&event, portMAX_DELAY)) {
+            switch (event.type) {
+            case UART_DATA:
+                if (event.size > 0) {
+                    int total = 0;
+                    /* 分批读取，处理 size 超过 RD_BUF_SIZE 的情况 */
+                    while (total < event.size) {
+                        int to_read = event.size - total;
+                        if (to_read > RD_BUF_SIZE) {
+                            to_read = RD_BUF_SIZE;
+                        }
+                        int len = uart_read_bytes(src, buf, to_read, portMAX_DELAY);
+                        if (len > 0) {
+                            uart_write_bytes(dest, buf, len);
+                            total += len;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                break;
+
+            case UART_FIFO_OVF:
+                ESP_LOGW(TAG, "UART%d FIFO overflow, flushing", src);
+                uart_flush_input(src);
+                xQueueReset(evt_queue);
+                break;
+
+            case UART_BUFFER_FULL:
+                ESP_LOGW(TAG, "UART%d ring buffer full, flushing", src);
+                uart_flush_input(src);
+                xQueueReset(evt_queue);
+                break;
+
+            case UART_BREAK:
+                ESP_LOGW(TAG, "UART%d RX break detected", src);
+                break;
+
+            case UART_PARITY_ERR:
+                ESP_LOGW(TAG, "UART%d parity error", src);
+                break;
+
+            case UART_FRAME_ERR:
+                ESP_LOGW(TAG, "UART%d frame error", src);
+                break;
+
+            default:
+                ESP_LOGW(TAG, "UART%d unhandled event type: %d", src, event.type);
+                break;
+            }
+        }
+    }
+
+    free(buf);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 初始化指定 UART 端口
+ */
+static void uart_init_port(uart_port_t port, int tx_pin, int rx_pin, QueueHandle_t *evt_queue)
+{
+    uart_config_t cfg = {
+        .baud_rate  = UART_BAUD_RATE,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,   // ESP32-C3: APB 80MHz
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(port, BUF_SIZE * 2, BUF_SIZE * 2,
+                                         EVT_QUEUE_SIZE, evt_queue, 0));
+    ESP_ERROR_CHECK(uart_param_config(port, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(port, tx_pin, rx_pin,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    ESP_LOGI(TAG, "UART%d initialized: TX=%d, RX=%d, Baud=%d",
+             port, tx_pin, rx_pin, UART_BAUD_RATE);
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, " UART0 <-> UART1 Bidirectional Forward");
+    ESP_LOGI(TAG, " Baud Rate: %d bps (5 MBaud)", UART_BAUD_RATE);
+    ESP_LOGI(TAG, "========================================");
+
+    /* 初始化 UART0 (保持默认引脚 GPIO20=RX, GPIO21=TX) */
+    uart_init_port(UART_NUM_0,
+                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                   &uart0_evt_queue);
+
+    /* 初始化 UART1 (RX=GPIO0, TX=GPIO1) */
+    uart_init_port(UART_NUM_1,
+                   UART1_TX_PIN, UART1_RX_PIN,
+                   &uart1_evt_queue);
+
+    /* 两个端口的参数，传递给转发任务 */
+    static uart_port_t fwd_0_to_1[] = { UART_NUM_0, UART_NUM_1 };
+    static uart_port_t fwd_1_to_0[] = { UART_NUM_1, UART_NUM_0 };
+
+    /* 创建双向转发任务，使用高优先级确保吞吐 */
+    xTaskCreate(uart_forward_task, "uart0_to_1", 4096, fwd_0_to_1,
+                configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(uart_forward_task, "uart1_to_0", 4096, fwd_1_to_0,
+                configMAX_PRIORITIES - 1, NULL);
+
+    ESP_LOGI(TAG, "Forwarding tasks started");
+}

@@ -1,0 +1,5 @@
+# 禁用 UART 控制台输出，释放 UART0 用于数据转发
+CONFIG_ESP_CONSOLE_UART_NONE=y
+
+# ESP32-C3 目标芯片
+CONFIG_IDF_TARGET="esp32c3"

@@ -1,0 +1,35 @@
+name: Build ESP32-C3 UART Forward
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ESP-IDF
+        run: |
+          git clone --depth 1 --branch v5.4.1 https://github.com/espressif/esp-idf.git ~/esp-idf
+          cd ~/esp-idf
+          ./install.sh esp32c3
+
+      - name: Build firmware
+        run: |
+          . ~/esp-idf/export.sh
+          idf.py set-target esp32c3
+          idf.py build
+          idf.py merge-bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uart_forward_firmware
+          path: |
+            build/merged.bin
