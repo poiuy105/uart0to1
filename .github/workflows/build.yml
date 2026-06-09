@@ -26,14 +26,9 @@ jobs:
           idf.py set-target esp32c3
           idf.py build
           idf.py merge-bin
-          echo "=== Build output files ==="
-          find build/ -name '*.bin' -type f
 
-      - name: Upload firmware artifact
+      - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
           name: uart_forward_firmware
-          path: |
-            build/*.bin
-            build/bootloader/*.bin
-            build/partition_table/*.bin
+          path: build/merged-binary.bin

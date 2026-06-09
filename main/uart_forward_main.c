@@ -19,6 +19,16 @@
 
 static const char *TAG = "UART_FWD";
 
+/* ============ ANSI 彩色输出宏 ============ */
+#define ANSI_RESET   "\033[0m"
+#define ANSI_RED     "\033[31m"
+#define ANSI_GREEN   "\033[32m"
+#define ANSI_YELLOW  "\033[33m"
+#define ANSI_BLUE    "\033[34m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_CYAN    "\033[36m"
+#define ANSI_BOLD    "\033[1m"
+
 /* ============ 引脚定义 ============ */
 #define UART1_RX_PIN    GPIO_NUM_0
 #define UART1_TX_PIN    GPIO_NUM_1
@@ -135,10 +145,15 @@ static void uart_init_port(uart_port_t port, int tx_pin, int rx_pin, QueueHandle
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, " UART0 <-> UART1 Bidirectional Forward");
-    ESP_LOGI(TAG, " Baud Rate: %d bps (5 MBaud)", UART_BAUD_RATE);
-    ESP_LOGI(TAG, "========================================");
+    printf(ANSI_BOLD ANSI_CYAN "\n"
+           "========================================\n"
+           " UART0 <-> UART1 Bidirectional Forward\n"
+           " Baud Rate: %d bps (5 MBaud)\n"
+           " ESP32-C3 (GPIO20/21 <-> GPIO0/1)\n"
+           "========================================\n"
+           ANSI_RESET "\n", UART_BAUD_RATE);
+
+    ESP_LOGI(TAG, "Initializing UART0 and UART1...");
 
     /* 初始化 UART0 (保持默认引脚 GPIO20=RX, GPIO21=TX) */
     uart_init_port(UART_NUM_0,
@@ -160,5 +175,9 @@ void app_main(void)
     xTaskCreate(uart_forward_task, "uart1_to_0", 4096, fwd_1_to_0,
                 configMAX_PRIORITIES - 1, NULL);
 
-    ESP_LOGI(TAG, "Forwarding tasks started");
+    printf(ANSI_BOLD ANSI_GREEN
+           "[READY] Forwarding tasks started!\n"
+           "  UART0 (GPIO21/GPIO20) <--> UART1 (GPIO1/GPIO0)\n"
+           "  Baud: %d bps\n"
+           ANSI_RESET "\n", UART_BAUD_RATE);
 }
