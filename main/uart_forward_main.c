@@ -97,7 +97,7 @@ static void uart_forward_task(void *param)
                 break;
 
             case UART_BREAK:
-                ESP_LOGW(TAG, "UART%d RX break detected", src);
+                /* RX 引脚悬空或拉低时会持续触发，静默忽略 */
                 break;
 
             case UART_PARITY_ERR:
