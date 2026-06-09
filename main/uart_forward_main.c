@@ -1,38 +1,119 @@
 /**
- * UART1 RX 引脚探测诊断工具 (ESP32-C3)
+ * UART0 <-> UART1 双向转发 (ESP32-C3)
  *
- * 交替将 UART1 RX 设为 GPIO0 和 GPIO1，各检测 3 秒，
- * 统计接收字节数，判断哪个引脚有持续的串口数据输入。
+ * UART0: 默认引脚 (GPIO20=RX, GPIO21=TX)
+ * UART1: RX=GPIO0, TX=GPIO1  (已确认 GPIO0 有数据输入)
+ * 波特率: 5,000,000 (5 MBaud)
  *
- * 输出通过 USB Serial/JTAG 查看。
+ * 采用事件驱动模型，双任务并行转发，高优先级运行
  */
 
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 
-static const char *TAG = "RX_DETECT";
+static const char *TAG = "UART_FWD";
 
-#define DETECT_BAUD_RATE  5000000
-#define BUF_SIZE          4096
-#define DETECT_DURATION_S 3
+/* ============ ANSI 彩色输出宏 ============ */
+#define ANSI_RESET   "\033[0m"
+#define ANSI_RED     "\033[31m"
+#define ANSI_GREEN   "\033[32m"
+#define ANSI_YELLOW  "\033[33m"
+#define ANSI_BLUE    "\033[34m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_CYAN    "\033[36m"
+#define ANSI_BOLD    "\033[1m"
 
-/**
- * @brief 在指定 RX 引脚上检测串口数据，返回接收到的字节数
- */
-static int detect_rx_on_pin(int rx_pin)
+/* ============ 引脚定义 (已确认正确) ============ */
+#define UART1_RX_PIN    GPIO_NUM_0   /* 数据输入在此引脚 */
+#define UART1_TX_PIN    GPIO_NUM_1
+
+/* ============ 缓冲与波特率配置 ============ */
+#define UART_BAUD_RATE  5000000     // 5 MBaud
+#define BUF_SIZE        4096
+#define RD_BUF_SIZE     4096
+#define EVT_QUEUE_SIZE  20
+
+/* ============ 事件队列句柄 ============ */
+static QueueHandle_t uart0_evt_queue = NULL;
+static QueueHandle_t uart1_evt_queue = NULL;
+
+static void uart_forward_task(void *param)
 {
-    QueueHandle_t evt_queue = NULL;
+    uart_port_t *ports = (uart_port_t *)param;
+    uart_port_t src  = ports[0];
+    uart_port_t dest = ports[1];
+    QueueHandle_t evt_queue = (src == UART_NUM_0) ? uart0_evt_queue : uart1_evt_queue;
 
-    /* 先删除可能存在的 UART1 驱动 */
-    uart_driver_delete(UART_NUM_1);
+    uart_event_t event;
+    uint8_t *buf = (uint8_t *)malloc(RD_BUF_SIZE);
+    assert(buf);
+
+    for (;;) {
+        if (xQueueReceive(evt_queue, (void *)&event, portMAX_DELAY)) {
+            switch (event.type) {
+            case UART_DATA:
+                if (event.size > 0) {
+                    int total = 0;
+                    while (total < event.size) {
+                        int to_read = event.size - total;
+                        if (to_read > RD_BUF_SIZE) to_read = RD_BUF_SIZE;
+                        int len = uart_read_bytes(src, buf, to_read, portMAX_DELAY);
+                        if (len > 0) {
+                            uart_write_bytes(dest, buf, len);
+                            total += len;
+                        } else break;
+                    }
+                }
+                break;
+
+            case UART_FIFO_OVF:
+                ESP_LOGW(TAG, "UART%d FIFO overflow, flushing", src);
+                uart_flush_input(src);
+                xQueueReset(evt_queue);
+                break;
+
+            case UART_BUFFER_FULL:
+                ESP_LOGW(TAG, "UART%d ring buffer full, flushing", src);
+                uart_flush_input(src);
+                xQueueReset(evt_queue);
+                break;
+
+            case UART_BREAK:
+                break;
+
+            case UART_PARITY_ERR:
+                ESP_LOGW(TAG, "UART%d parity error", src);
+                break;
+
+            case UART_FRAME_ERR:
+                ESP_LOGW(TAG, "UART%d frame error", src);
+                break;
+
+            default:
+                ESP_LOGW(TAG, "UART%d unhandled event type: %d", src, event.type);
+                break;
+            }
+        }
+    }
+
+    free(buf);
+    vTaskDelete(NULL);
+}
+
+static void uart_init_port(uart_port_t port, int tx_pin, int rx_pin, QueueHandle_t *evt_queue)
+{
+    if (port == UART_NUM_0) {
+        uart_driver_delete(UART_NUM_0);
+    }
 
     uart_config_t cfg = {
-        .baud_rate  = DETECT_BAUD_RATE,
+        .baud_rate  = UART_BAUD_RATE,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -40,90 +121,48 @@ static int detect_rx_on_pin(int rx_pin)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    esp_err_t ret = uart_driver_install(UART_NUM_1, BUF_SIZE * 2, BUF_SIZE * 2,
-                                        20, &evt_queue, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(ret));
-        return -1;
-    }
+    ESP_ERROR_CHECK(uart_driver_install(port, BUF_SIZE * 2, BUF_SIZE * 2,
+                                         EVT_QUEUE_SIZE, evt_queue, 0));
+    ESP_ERROR_CHECK(uart_param_config(port, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(port, tx_pin, rx_pin,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    uart_param_config(UART_NUM_1, &cfg);
-    /* TX 引脚设为 -1（不使用），只关心 RX */
-    uart_set_pin(UART_NUM_1, -1, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    ESP_LOGI(TAG, "Testing UART1 RX on GPIO%d for %d seconds...", rx_pin, DETECT_DURATION_S);
-
-    int total_bytes = 0;
-    uint8_t buf[256];
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(DETECT_DURATION_S * 1000);
-
-    while (xTaskGetTickCount() < deadline) {
-        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf), pdMS_TO_TICKS(100));
-        if (len > 0) {
-            total_bytes += len;
-        }
-    }
-
-    uart_driver_delete(UART_NUM_1);
-
-    return total_bytes;
+    ESP_LOGI(TAG, "UART%d initialized: TX=%d, RX=%d, Baud=%d",
+             port, tx_pin, rx_pin, UART_BAUD_RATE);
 }
 
 void app_main(void)
 {
-    /* 等待 USB Serial/JTAG 连接就绪 */
-    vTaskDelay(pdMS_TO_TICKS(500));
+    printf(ANSI_BOLD ANSI_CYAN "\n"
+           "========================================\n"
+           " UART0 <-> UART1 Bidirectional Forward\n"
+           " Baud Rate: %d bps (5 MBaud)\n"
+           " ESP32-C3 (GPIO20/21 <-> GPIO0/1)\n"
+           " [RX confirmed on GPIO0]\n"
+           "========================================\n"
+           ANSI_RESET "\n", UART_BAUD_RATE);
 
-    printf("\n========================================\n");
-    printf("  UART1 RX Pin Detection Tool\n");
-    printf("  Baud: %d bps\n", DETECT_BAUD_RATE);
-    printf("  Each test: %d seconds\n", DETECT_DURATION_S);
-    printf("========================================\n\n");
+    ESP_LOGI(TAG, "Initializing UART0 and UART1...");
 
-    /* 第一轮：测试 GPIO0 */
-    int gpio0_bytes = detect_rx_on_pin(GPIO_NUM_0);
-    printf("[RESULT] GPIO0 as RX: received %d bytes\n\n", gpio0_bytes);
+    uart_init_port(UART_NUM_0,
+                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                   &uart0_evt_queue);
 
-    /* 短暂间隔，让线路稳定 */
-    vTaskDelay(pdMS_TO_TICKS(500));
+    uart_init_port(UART_NUM_1,
+                   UART1_TX_PIN, UART1_RX_PIN,
+                   &uart1_evt_queue);
 
-    /* 第二轮：测试 GPIO1 */
-    int gpio1_bytes = detect_rx_on_pin(GPIO_NUM_1);
-    printf("[RESULT] GPIO1 as RX: received %d bytes\n\n", gpio1_bytes);
+    static uart_port_t fwd_0_to_1[] = { UART_NUM_0, UART_NUM_1 };
+    static uart_port_t fwd_1_to_0[] = { UART_NUM_1, UART_NUM_0 };
 
-    /* 输出结论 */
-    printf("========================================\n");
-    printf("  DETECTION RESULT\n");
-    printf("  GPIO0 RX: %d bytes\n", gpio0_bytes);
-    printf("  GPIO1 RX: %d bytes\n", gpio1_bytes);
-    printf("----------------------------------------\n");
+    xTaskCreate(uart_forward_task, "uart0_to_1", 4096, fwd_0_to_1,
+                configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(uart_forward_task, "uart1_to_0", 4096, fwd_1_to_0,
+                configMAX_PRIORITIES - 1, NULL);
 
-    if (gpio0_bytes > 0 && gpio1_bytes == 0) {
-        printf("  >> Data detected on GPIO0\n");
-        printf("  >> Set UART1_RX_PIN = GPIO_NUM_0\n");
-    } else if (gpio1_bytes > 0 && gpio0_bytes == 0) {
-        printf("  >> Data detected on GPIO1\n");
-        printf("  >> Set UART1_RX_PIN = GPIO_NUM_1\n");
-    } else if (gpio0_bytes > 0 && gpio1_bytes > 0) {
-        printf("  >> Data on BOTH pins! (GPIO0: %d, GPIO1: %d)\n", gpio0_bytes, gpio1_bytes);
-        printf("  >> GPIO%d has more data\n", gpio0_bytes >= gpio1_bytes ? 0 : 1);
-    } else {
-        printf("  >> NO data detected on either pin\n");
-        printf("  >> Check: wiring, baud rate, and data source\n");
-    }
-    printf("========================================\n\n");
-
-    /* 再做第二轮确认 */
-    printf("--- Running confirmation round ---\n\n");
-    int gpio0_r2 = detect_rx_on_pin(GPIO_NUM_0);
-    printf("[CONFIRM] GPIO0 as RX: %d bytes\n\n", gpio0_r2);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    int gpio1_r2 = detect_rx_on_pin(GPIO_NUM_1);
-    printf("[CONFIRM] GPIO1 as RX: %d bytes\n\n", gpio1_r2);
-
-    printf("========================================\n");
-    printf("  FINAL RESULT (2 rounds averaged)\n");
-    printf("  GPIO0: round1=%d  round2=%d  total=%d\n", gpio0_bytes, gpio0_r2, gpio0_bytes + gpio0_r2);
-    printf("  GPIO1: round1=%d  round2=%d  total=%d\n", gpio1_bytes, gpio1_r2, gpio1_bytes + gpio1_r2);
-    printf("========================================\n");
+    printf(ANSI_BOLD ANSI_GREEN
+           "[READY] Forwarding tasks started!\n"
+           "  UART0 (GPIO21/GPIO20) <--> UART1 (GPIO1/GPIO0)\n"
+           "  Baud: %d bps\n"
+           ANSI_RESET "\n", UART_BAUD_RATE);
 }
