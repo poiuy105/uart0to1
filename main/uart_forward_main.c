@@ -60,8 +60,8 @@ static void monitor_task(void *arg)
 void app_main(void)
 {
     usb_serial_jtag_driver_config_t usb_cfg = {
-        .tx_buffer_size = 64,
-        .rx_buffer_size = 64,
+        .tx_buffer_size = 128,
+        .rx_buffer_size = 128,
     };
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
 
