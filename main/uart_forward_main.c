@@ -25,7 +25,7 @@ static const char *TAG = "USB_UART_FWD";
 #define UART1_TX_PIN    GPIO_NUM_1
 
 /* ============ 缓冲配置 ============ */
-#define UART_BAUD_RATE  5000000
+#define UART_BAUD_RATE  256000
 #define BUF_SIZE        4096
 #define USB_BUF_SIZE    4096
 #define EVT_QUEUE_SIZE  20
