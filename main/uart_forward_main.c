@@ -66,7 +66,7 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
 
     uart_config_t uart_cfg = {
-        .baud_rate  = 115200,
+        .baud_rate  = 256000,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
