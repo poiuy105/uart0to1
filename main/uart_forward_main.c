@@ -1,160 +1,111 @@
 /**
  * USB Serial/JTAG (CDC) <-> UART1 双向转发 (ESP32-C3)
  *
- * USB CDC: COM33 (通过 USB 连接电脑)
- * UART1:   RX=GPIO0, TX=GPIO1 (已确认 GPIO0 有数据输入)
- * 波特率:  5,000,000 (5 MBaud)
+ * USB CDC: COM33
+ * UART1:   RX=GPIO0, TX=GPIO1
+ * 波特率:  动态跟随 USB CDC 主机设置
  *
- * 采用双任务 + 环形缓冲区，高优先级运行
+ * 当用户在串口工具中修改波特率时，UART1 波特率自动同步
  */
 
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "driver/usb_serial_jtag.h"
 
-static const char *TAG = "USB_UART_FWD";
+static const char *TAG = "FWD";
 
-/* ============ 引脚定义 ============ */
 #define UART1_RX_PIN    GPIO_NUM_0
 #define UART1_TX_PIN    GPIO_NUM_1
-
-/* ============ 缓冲配置 ============ */
-#define UART_BAUD_RATE  256000
-#define BUF_SIZE        4096
-#define USB_BUF_SIZE    4096
+#define DEFAULT_BAUD    256000
+#define BUF_SIZE        1024
 #define EVT_QUEUE_SIZE  20
 
-/* ============ 转发统计 ============ */
-static volatile uint32_t fwd_usb_to_uart_bytes = 0;
-static volatile uint32_t fwd_uart_to_usb_bytes = 0;
+static volatile uint32_t fwd_usb_to_uart = 0;
+static volatile uint32_t fwd_uart_to_usb = 0;
 
 /**
- * @brief USB -> UART1 转发任务
- * 从 USB Serial/JTAG 读取数据，写入 UART1
+ * @brief USB CDC 线路编码变化回调
+ * 当主机修改波特率时，同步更新 UART1 波特率
  */
-static void usb_to_uart_task(void *param)
+static void line_coding_cb(void *arg)
 {
-    uint8_t *buf = (uint8_t *)malloc(USB_BUF_SIZE);
-    assert(buf);
+    /* 读取当前 USB CDC 的波特率设置 */
+    usb_serial_jtag_line_coding_t coding;
+    usb_serial_jtag_get_line_coding(&coding);
+    ESP_LOGI(TAG, "Baud rate changed: %d -> %d", 
+             uart_get_baudrate(UART_NUM_1), coding.bit_rate);
+    uart_set_baudrate(UART_NUM_1, coding.bit_rate);
+}
 
-    ESP_LOGI(TAG, "USB -> UART1 task started");
-
+static void usb_to_uart_task(void *arg)
+{
+    uint8_t buf[BUF_SIZE];
     for (;;) {
-        int len = usb_serial_jtag_read_bytes(buf, USB_BUF_SIZE, pdMS_TO_TICKS(10));
+        int len = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
         if (len > 0) {
             uart_write_bytes(UART_NUM_1, buf, len);
-            fwd_usb_to_uart_bytes += len;
+            fwd_usb_to_uart += len;
         }
     }
-
-    free(buf);
-    vTaskDelete(NULL);
 }
 
-/**
- * @brief UART1 -> USB 转发任务
- * 从 UART1 读取数据，写入 USB Serial/JTAG
- */
-static void uart_to_usb_task(void *param)
+static void uart_to_usb_task(void *arg)
 {
-    uint8_t *buf = (uint8_t *)malloc(BUF_SIZE);
-    assert(buf);
-
-    ESP_LOGI(TAG, "UART1 -> USB task started");
-
+    uint8_t buf[BUF_SIZE];
     for (;;) {
-        int len = uart_read_bytes(UART_NUM_1, buf, BUF_SIZE, pdMS_TO_TICKS(10));
+        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf), portMAX_DELAY);
         if (len > 0) {
             usb_serial_jtag_write_bytes(buf, len, portMAX_DELAY);
-            fwd_uart_to_usb_bytes += len;
+            fwd_uart_to_usb += len;
         }
     }
-
-    free(buf);
-    vTaskDelete(NULL);
 }
 
-/**
- * @brief 统计监控任务
- */
-static void monitor_task(void *param)
+static void monitor_task(void *arg)
 {
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        uint32_t a = fwd_usb_to_uart_bytes;
-        uint32_t b = fwd_uart_to_usb_bytes;
-        ESP_LOGI(TAG, "[STATS] USB->UART1: %lu bytes | UART1->USB: %lu bytes",
-                 (unsigned long)a, (unsigned long)b);
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        ESP_LOGI(TAG, "USB->UART1: %lu | UART1->USB: %lu | Baud: %d",
+                 (unsigned long)fwd_usb_to_uart, (unsigned long)fwd_uart_to_usb,
+                 uart_get_baudrate(UART_NUM_1));
     }
 }
 
-/**
- * @brief 初始化 UART1
- */
-static void uart1_init(void)
+void app_main(void)
 {
-    uart_config_t cfg = {
-        .baud_rate  = UART_BAUD_RATE,
+    /* USB Serial/JTAG */
+    usb_serial_jtag_driver_config_t usb_cfg = {
+        .tx_buffer_size = 1024,
+        .rx_buffer_size = 1024,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
+
+    /* 注册线路编码变化回调 */
+    usb_serial_jtag_register_line_coding_cb(line_coding_cb, NULL);
+
+    /* UART1 */
+    uart_config_t uart_cfg = {
+        .baud_rate  = DEFAULT_BAUD,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, BUF_SIZE * 2, BUF_SIZE * 2,
-                                        EVT_QUEUE_SIZE, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &cfg));
+                                         EVT_QUEUE_SIZE, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART1_TX_PIN, UART1_RX_PIN,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART1 initialized: TX=GPIO%d, RX=GPIO%d, Baud=%d",
-             UART1_TX_PIN, UART1_RX_PIN, UART_BAUD_RATE);
-}
+    ESP_LOGI(TAG, "USB<->UART1 forwarding started (Baud: %d, dynamic)", DEFAULT_BAUD);
 
-/**
- * @brief 初始化 USB Serial/JTAG
- */
-static void usb_init(void)
-{
-    usb_serial_jtag_driver_config_t cfg = {
-        .tx_buffer_size = USB_BUF_SIZE,
-        .rx_buffer_size = USB_BUF_SIZE,
-    };
-
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
-    ESP_LOGI(TAG, "USB Serial/JTAG driver installed");
-}
-
-void app_main(void)
-{
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, " USB Serial/JTAG <-> UART1 Forward");
-    ESP_LOGI(TAG, " Baud: %d bps | ESP32-C3", UART_BAUD_RATE);
-    ESP_LOGI(TAG, " UART1: TX=GPIO1, RX=GPIO0");
-    ESP_LOGI(TAG, " USB:   COM33 (Serial/JTAG CDC)");
-    ESP_LOGI(TAG, "========================================");
-
-    /* 初始化 USB Serial/JTAG */
-    usb_init();
-
-    /* 初始化 UART1 */
-    uart1_init();
-
-    /* 创建转发任务 */
-    xTaskCreate(usb_to_uart_task, "usb_to_uart", 4096, NULL,
-                configMAX_PRIORITIES - 1, NULL);
-    xTaskCreate(uart_to_usb_task, "uart_to_usb", 4096, NULL,
-                configMAX_PRIORITIES - 1, NULL);
-
-    /* 统计监控 */
+    xTaskCreate(usb_to_uart_task, "usb2uart", 4096, NULL, configMAX_PRIORITIES - 1, NULL);
+    xTaskCreate(uart_to_usb_task, "uart2usb", 4096, NULL, configMAX_PRIORITIES - 1, NULL);
     xTaskCreate(monitor_task, "monitor", 2048, NULL, 1, NULL);
-
-    ESP_LOGI(TAG, "[READY] Forwarding started!");
 }
